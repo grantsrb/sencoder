@@ -1,0 +1,7 @@
+numpy
+keras
+torch
+torchvision
+tqdm
+psutil
+
