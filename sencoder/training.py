@@ -5,7 +5,7 @@ import torch
 from torch.nn import CrossEntropyLoss, MSELoss
 from torch.optim.lr_scheduler import *
 import sencoder.datas as datas
-import sencoder.utils as utils
+import sencoder.io as io
 from sencoder.models import *
 import time
 import math
@@ -69,9 +69,9 @@ def get_optim_objs(hyps, model):
                                                  patience=8)
     return optimizer, scheduler, enc_lossfxn, dec_lossfxn
 
-def print_train_update(loss, acc, enc_loss, dec_loss, emb_loss, n_loops, i):
-    s = "Loss:{:.4e} | Acc:{:.4e} | enc:{:.4e} | dec:{:.4e} | emb:{:.4e} | {}/{}".format(loss,
-                                            acc, enc_loss, dec_loss, emb_loss, i, n_loops)
+def print_train_update(loss, acc, enc_loss, dec_loss, n_loops, i):
+    s = "Loss:{:.4e} | Acc:{:.4e} | enc:{:.4e} | dec:{:.4e} | {}/{}".format(loss,
+                                            acc, enc_loss, dec_loss, i, n_loops)
     print(s, end="       \r")
 
 def get_data_distrs(hyps):
@@ -112,7 +112,6 @@ def train(hyps, verbose=False):
     train_distr, val_distr = get_data_distrs(hyps)
 
     hyps["n_words"] = len(train_distr.dataset.word2idx)
-    hyps['stop_idx'] = train_distr.dataset.stop_idx
     model = get_model(hyps)
 
     record_session(model, hyps)
@@ -140,11 +139,15 @@ def train(hyps, verbose=False):
                                    hyps['save_folder'])
         # Batch Loop
         optimizer.zero_grad()
+        seq_len = hyps['seq_len']
+        dec_losses = [0 for i in range(seq_len)]
+        #global_h = model.encoder.init_h(batch_size)
         for i,(X,y) in enumerate(train_distr):
             """
             X: torch FloatTensor (B,S)
-                batch of word sequences. S is seq_len
+                batch of idx sequences. S is seq_len
             y: torch FloatTensor (B,S)
+                batch of idx sequences shfited by 1.
             """
             if len(y) <= 1:
                 i -= 1
@@ -152,38 +155,37 @@ def train(hyps, verbose=False):
             iterstart = time.time()
             y = y.long().to(DEVICE).reshape(-1)
             X = X.long()
-            embs = model.embed(X)
-            #### TODO: Fit classifier
-            enc_states,enc_embs = model.encode(embs)
-            enc_embs = torch.stack(enc_embs, dim=1)
-            enc_embs = enc_embs.reshape(-1,enc_embs.shape[-1])
-            enc_preds = model.classify(enc_embs) # (B*S,N)
+            embs = model.embed(X) # (B,S,E)
+
+            # Make next word predictions with encoder
+            tup = model.encode(embs,h)
+            enc_hs, enc_mus, enc_sigmas, enc_states = tup
+            global_h = enc_hs[0]
+            s_size = hyps['s_size']
+            mus = enc_mus.reshape(-1,s_size)
+            sigmas = enc_sigmas.reshape(-1,s_size)
+            enc_preds = model.classify(mus, sigmas)
             enc_loss = enc_lossfxn(enc_preds, y) # scalar
 
-            # TODO: Figure out decoder training scheme
-                # Fit state distrubutions
-            #for j,state in enumerate(states):
-            #    temp_embs = embs[-j:]
-            #    dec_states,dec_embs = model.decode(state, seq_len=j,
-            #                                         embs=temp_embs)
-            #dec_embs = torch.stack(dec_embs, dim=1)
-            ##model.enc_requires_grad(False)
-            ##dec_encoding,_ = model.encode(dec_embs)
-            ##model.enc_requires_grad(True)
-            ##dec_enc_loss = dec_lossfxn(dec_encoding[-1],
-            ##                        encoding[-1].data)
-            dec_enc_loss = torch.zeros(1).cuda()
-
-            #dec_embs = dec_embs.reshape(-1,dec_embs.shape[-1])
-            #model.class_requires_grad(False)
-            #dec_preds = model.classify(dec_embs) # (B*S,N)
-            #model.class_requires_grad(True)
-            #X = X.reshape(-1).to(DEVICE)
-            #dec_emb_loss = enc_lossfxn(dec_preds, X) # scalar
-            dec_emb_loss = torch.zeros(1).cuda()
-
-            dec_loss = dec_emb_loss + dec_enc_loss
+            dec_loss = torch.zeros(1).to(DEVICE)
+            for j in range(0,len(enc_hs),5):
+                state = enc_states[j]
+                h = (enc_hs[j],enc_mus[:,j],enc_sigmas[:,j])
+                hs,mus,sigmas = model.decode(state, h, seq_len=j+1,
+                                        classifier=model.classifier,
+                                        embeddings=model.embeddings)
+                mus = torch.stack(mus, dim=1)
+                mus = mus.reshape(-1,s_size)
+                sigmas = torch.stack(sigmas, dim=1)
+                sigmas = sigmas.reshape(-1,s_size)
+                dec_preds = model.classify(mus, sigmas)
+                targs = torch.flip(X[:,:j+1],dims=(1,))
+                targs = targs.to(DEVICE).reshape(-1)
+                loss = dec_lossfxn(dec_preds, targs)/(j+1)
+                dec_losses[j] += loss.item()
+                dec_loss += loss
             loss = alpha*dec_loss + (1-alpha)*enc_loss
+            #loss = enc_loss
             loss = loss/hyps['optim_batches']
             loss.backward()
             if hyps['optim_batches'] == 1 or\
@@ -199,8 +201,7 @@ def train(hyps, verbose=False):
             if verbose:
                 looptime = time.time()-iterstart
                 print_train_update(loss.item(), acc.item(),
-                         enc_loss.item(), dec_enc_loss.item(),
-                         dec_emb_loss.item(),
+                         enc_loss.item(), dec_loss.item(),
                          n_loops, i)
             if math.isnan(epoch_loss) or math.isinf(epoch_loss)\
                                     or hyps['exp_name']=="test":
@@ -209,10 +210,12 @@ def train(hyps, verbose=False):
         n_loops = i+1 # Just in case miscalculated
         avg_loss = epoch_loss/n_loops
         avg_acc = epoch_acc/n_loops
+        dec_avgs = ["{:.3e}".format(d/n_loops) for d in dec_losses]
         looptime = time.time()-starttime
         s = 'Avg Loss: {} | Avg Acc: {} | Time: {}\n'.format(
                                             avg_loss, avg_acc,
                                             looptime)
+        s += "DecLosses:" + "|".join(dec_avgs) + "\n"
         stats_string += s
 
         # Validation
@@ -221,6 +224,7 @@ def train(hyps, verbose=False):
         n_loops = len(val_distr)
         val_loss = 0
         val_acc  = 0
+        dec_val_acc = 0
         if verbose:
             print()
             print("Validating")
@@ -237,39 +241,42 @@ def train(hyps, verbose=False):
                 X = X.long()
                 embs = model.embed(X)
 
-                #### TODO: Fit classifier
-                states,enc_embs = model.encode(embs)
-                enc_embs = torch.stack(enc_embs, dim=1)
-                enc_embs = enc_embs.reshape(-1,enc_embs.shape[-1])
-                enc_preds = model.classify(enc_embs) # (B*S,N)
+                tup = model.encode(embs)
+                enc_hs, enc_mus, enc_sigmas, enc_states = tup
+                s_size = hyps['s_size']
+                mus = enc_mus.reshape(-1,s_size)
+                sigmas = enc_sigmas.reshape(-1,s_size)
+                enc_preds = model.classify(mus, sigmas)
                 enc_loss = enc_lossfxn(enc_preds, y) # scalar
 
-                #_,dec_embs = model.decode(encoding[0].data, seq_len=seq_len)
-                #dec_embs = torch.stack(dec_embs, dim=1)
-                ##dec_encoding,_ = model.encode(dec_embs)
-                ##dec_enc_loss = dec_lossfxn(dec_encoding[-1],
-                ##                        encoding[-1].data)
-                dec_enc_loss = torch.zeros(1).to(DEVICE)
+                state = enc_states[-1]
+                h = (enc_hs[-1],enc_mus[:,-1],enc_sigmas[:,-1])
+                hs,mus,sigmas = model.decode(state,h,seq_len=seq_len,
+                                        classifier=model.classifier,
+                                        embeddings=model.embeddings)
+                mus = torch.stack(mus, dim=1)
+                mus = mus.reshape(-1,s_size)
+                sigmas = torch.stack(sigmas, dim=1)
+                sigmas = sigmas.reshape(-1,s_size)
+                dec_preds = model.classify(mus, sigmas)
+                targs = torch.flip(X[:,:],dims=(1,))
+                targs = targs.to(DEVICE).reshape(-1)
+                dec_loss = dec_lossfxn(dec_preds, targs)
 
-                #dec_embs = dec_embs.reshape(-1,dec_embs.shape[-1])
-                #dec_preds = model.classify(dec_embs) # (B*S,N)
-                #X = X.reshape(-1).to(DEVICE)
-                #dec_emb_loss = enc_lossfxn(dec_preds, X) # scalar
-                dec_emb_loss = torch.zeros(1).to(DEVICE)
-
-                dec_loss = dec_emb_loss + dec_enc_loss
                 loss = alpha*dec_loss + (1-alpha)*enc_loss
                 loss = loss/hyps['optim_batches']
 
                 argmaxes=torch.argmax(enc_preds,dim=-1).long()
                 acc = (argmaxes.squeeze()==y).float().mean()
+                decmaxes=torch.argmax(dec_preds,dim=-1).long()
+                dec_acc = (decmaxes.squeeze()==targs).float().mean()
 
                 val_loss += loss.item()
                 val_acc += acc.item()
+                dec_val_acc += dec_acc.item()
                 if verbose:
                     print_train_update(loss.item(), acc.item(),
-                             enc_loss.item(), dec_enc_loss.item(),
-                             dec_emb_loss.item(),
+                             enc_loss.item(), dec_loss.item(),
                              n_loops, i)
                 if math.isnan(loss) or math.isinf(loss) or\
                                     hyps['exp_name']=="test":
@@ -280,9 +287,11 @@ def train(hyps, verbose=False):
         # Validation Evaluation
         val_loss = val_loss/n_loops
         val_acc = val_acc/n_loops
+        dec_val_acc = dec_val_acc/n_loops
         looptime = time.time()-starttime
-        s = 'Val Loss: {} | Val Acc: {} | Time: {}\n'
-        stats_string += s.format(val_loss, val_acc, looptime)
+        s = 'Val Loss: {} | Val Acc: {} | Dec Acc: {} | Time: {}\n'
+        stats_string += s.format(val_loss, val_acc, dec_val_acc,
+                                                       looptime)
 
         idx2word = train_distr.dataset.idx2word
         reals = y.reshape(y_shape)[0]
@@ -295,10 +304,11 @@ def train(hyps, verbose=False):
         enc_str = " ".join(enc_words)
         stats_string += "Enc: {}\n".format(enc_str)
 
-        #decs = torch.argmax(dec_preds, dim=-1).long().reshape(y_shape)[0]
-        #dec_words = [idx2word[arg.item()] for arg in decs]
-        #dec_str = " ".join(dec_words)
-        #stats_string += "Dec: {}\n".format(dec_str)
+        decmaxes = decmaxes.reshape(y_shape)[0]
+        words = [idx2word[arg.item()] for arg in decmaxes]
+        dec_words = reversed(words)
+        dec_str = " ".join(dec_words)
+        stats_string += "Dec: {}\n".format(dec_str)
 
         if 'scheduler' in hyps and\
                        hyps['scheduler'] == "CosineAnnealingLR":
@@ -319,11 +329,13 @@ def train(hyps, verbose=False):
             "val_loss":val_loss,
             "val_acc":val_acc,
             "hyps":hyps,
+            "word2idx":train_distr.dataset.word2idx,
+            "idx2word":train_distr.dataset.idx2word,
         }
         for k in hyps.keys():
             if k not in save_dict:
                 save_dict[k] = hyps[k]
-        utils.save_checkpoint(save_dict, hyps['save_folder'], del_prev=True)
+        io.save_checkpoint(save_dict, hyps['save_folder'], del_prev=True)
 
         # Print Epoch Stats
         gc.collect()
@@ -390,7 +402,8 @@ def fill_hyper_q(hyps, hyp_ranges, keys, hyper_q, idx=0):
             hyper_q = fill_hyper_q(hyps, hyp_ranges, keys, hyper_q, idx+1)
     return hyper_q
 
-def hyper_search(hyps, hyp_ranges, keys, device, early_stopping=10, stop_tolerance=.01):
+def hyper_search(hyps, hyp_ranges, keys, device, early_stopping=10,
+                                               stop_tolerance=.01):
     starttime = time.time()
     # Make results file
     if not os.path.exists(hyps['exp_name']):

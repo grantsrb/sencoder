@@ -5,7 +5,6 @@ import torch.nn as nn
 import subprocess
 import json
 import os
-import torchdeepretina.stimuli as tdrstim
 from tqdm import tqdm
 import scipy.stats
 import pickle
@@ -291,33 +290,6 @@ def get_stim_grad(model, X, layer, cell_idx, batch_size=500, layer_shape=None, t
     else:
         return X.grad.data.cpu()
 
-def compute_sta(model, contrast, layer, cell_index, layer_shape=None, batch_size=500, 
-                                                         n_samples=10000,to_numpy=True, 
-                                                         verbose=True):
-    """
-    Computes the STA using the average of instantaneous receptive 
-    fields (gradient of output with respect to input)
-
-    model: torch Module
-    contrast: float
-        contrast of whitenoise to calculate the sta
-    layer
-    """
-    # generate some white noise
-    X = rolling_window(tdrstim.white(n_samples, contrast=contrast),model.img_shape[0])
-    #X = rolling_window(contrast*np.random.randn(n_samples,50,50),nh=model.img_shape[0])
-    X = torch.FloatTensor(X)
-    X.requires_grad = True
-
-    # compute the gradient of the model with respect to the stimulus
-    drdx = get_stim_grad(model, X, layer, cell_index, layer_shape=layer_shape,
-                                       batch_size=batch_size, to_numpy=to_numpy,
-                                                                verbose=verbose)
-    sta = drdx.mean(0)
-
-    del X
-    return sta
-
 def get_mean(x, axis=None, batch_size=1000):
     """
     Returns mean of x along argued axis. Used in cases of large datasets.
@@ -592,52 +564,6 @@ def multi_shuffle(arrays):
             arrays[j][idx:idx+1] = temp
             del temp
     return arrays
-
-def save_checkpoint(save_dict, folder, del_prev=False):
-    """
-    save_dict: dict
-        all things to save to file
-    folder: str
-        path of folder to be saved to
-    del_prev: bool
-        if true, deletes the model_state_dict and optim_state_dict of the save of the
-        previous file (saves space)
-    """
-    if del_prev:
-        prev_path = os.path.join(folder, "epoch_" + str(save_dict['epoch']-1) + '.pt')
-        if os.path.exists(prev_path):
-            device = torch.device("cpu")
-            data = torch.load(prev_path, map_location=device)
-            keys = list(data.keys())
-            for key in keys:
-                if "state_dict" in key:
-                    del data[key]
-            torch.save(data, prev_path)
-        elif save_dict['epoch'] != 0:
-            print("Failed to find previous checkpoint", prev_path)
-    path = os.path.join(folder, 'epoch_' + str(save_dict['epoch'])) + '.pt'
-    path = os.path.abspath(os.path.expanduser(path))
-    torch.save(save_dict, path)
-
-def load_checkpoint(checkpt_path):
-    """
-    Can load a specific model file both architecture and state_dict if the file 
-    contains a model_state_dict key, or can just load the architecture.
-
-    checkpt_path: str
-        path to checkpoint file
-    """
-    data = torch.load(folder, map_location=torch.device("cpu"))
-    try:
-        model = globals()[data['model_type']](**data['model_hyps'])
-    except Exception as e:
-        print(e)
-        print("Likely the checkpoint you are using is deprecated. Try using analysis.load_model()")
-    try:
-        model.load_state_dict(data['model_state_dict'])
-    except KeyError as e:
-        print("Failed to load state_dict. This checkpoint does not contain a model state_dict!")
-    return model
 
 def stackedconv2d_to_conv2d(stackedconv2d):
     """

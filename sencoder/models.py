@@ -56,8 +56,11 @@ class RSSM(nn.Module, CustomModule):
         self.rnn_type = rnn_type
         self.min_sigma = min_sigma
 
-        self.rnn = globals()[rnn_type](input_size=(s_size+emb_size), hidden_size=h_size) # Dynamics rnn
-        self.state_layer = nn.Linear(h_size, 2*s_size) # Creates mu and sigma for state gaussian
+        in_size = (s_size+emb_size)
+        self.rnn = globals()[rnn_type](input_size=in_size,
+                                        hidden_size=h_size)
+        # Creates mu and sigma for state gaussian
+        self.state_layer = nn.Linear(h_size, 2*s_size)
 
     def init_h(self, batch_size):
         if self.rnn_type == "DoubleLSTMCell":
@@ -80,11 +83,28 @@ class RSSM(nn.Module, CustomModule):
 
     def forward(self, x, h_tup):
         h,mu,sigma = h_tup
-        noise = torch.randn(*sigma.shape)
-        if sigma.is_cuda:
-            noise = noise.to(DEVICE)
-        s = sigma*noise+mu
+        s = sigma*torch.randn_like(sigma)+mu
         x = torch.cat([s,x], dim=-1)
+        h_new = self.rnn(x, h)
+        musigma = self.state_layer(h_new[0])
+        mu, sigma = torch.chunk(musigma, 2, dim=-1)
+        sigma = F.softplus(sigma) + self.min_sigma
+        return h_new, mu, sigma
+
+    def state_fwd(self, x, h_tup, state):
+        """
+        Same as forward function but includes an extra state
+        vector. Improves speed by reducing concatenations.
+
+        x: FloatTesor (B,E)
+        h_tup: list or tuple of FloatTensors [rnn_h, (B,S), (B,S)]
+            h,mu,sigma
+        state: FloatTensor (B,S)
+            the encoded state vector
+        """
+        h,mu,sigma = h_tup
+        s = sigma*torch.randn_like(sigma)+mu
+        x = torch.cat([s,x,state], dim=-1)
         h_new = self.rnn(x, h)
         musigma = self.state_layer(h_new[0])
         mu, sigma = torch.chunk(musigma, 2, dim=-1)
@@ -98,11 +118,11 @@ class RSSM(nn.Module, CustomModule):
                                     self.emb_size, self.min_sigma)
 
 class Encoder(nn.Module):
-    def __init__(self, emb_size, rssm_kwargs, proj_size=500,
-                                  proj_layers=2, **kwargs):
+    def __init__(self, emb_size, rssm_kwargs, attention=False,
+                                                    **kwargs):
         super().__init__()
         self.emb_size = emb_size
-        self.proj_size = proj_size
+        self.attention = None
         self.rssm = RSSM(**rssm_kwargs)
         if try_kwarg(kwargs, 'wnorm', False):
             rnn = self.rssm.rnn
@@ -112,20 +132,10 @@ class Encoder(nn.Module):
             for name in names:
                 if 'bias' not in name:
                     rnn = nn.utils.weight_norm(rnn, name)
-        # Projection NN
-        modules = []
-        in_size = self.rssm.h_size+self.rssm.s_size
-        if proj_layers == 1:
-            modules.append(nn.Linear(in_size, emb_size))
-        else:
-            modules.append(nn.Linear(in_size, proj_size))
-        for i in range(proj_layers-1):
-            modules.append(nn.ReLU())
-            if i < proj_layers-2:
-                modules.append(nn.Linear(proj_size, proj_size))
-            else:
-                modules.append(nn.Linear(proj_size, emb_size))
-        self.projection = nn.Sequential(*modules)
+        if attention:
+            h_size = rssm_kwargs['h_size']
+            s_size = rssm_kwargs['s_size']
+            self.attention = nn.Linear(h_size+s_size,1)
 
     def init_h(self, batch_size):
         return self.rssm.init_h(batch_size)
@@ -140,38 +150,37 @@ class Encoder(nn.Module):
         """
         if h is None:
             h = self.init_h(len(X))
-        embs = []
+        hs = []
+        mus = torch.zeros(*X.shape[:2],self.rssm.s_size).to(DEVICE)
+        sigmas = torch.zeros(*X.shape[:2],self.rssm.s_size).to(DEVICE)
         states = []
+        #scores = torch.zeros(*X.shape[:2]).to(DEVICE)
+        scores = []
         for i in range(X.shape[1]):
             x = X[:,i]
             h = self.rssm(x,h)
-            states.append(h)
-            noise = torch.randn(h[1].shape)
-            if h[1].is_cuda:
-                noise = noise.to(DEVICE)
-            s = h[1]+h[2]*noise
-            x = torch.cat([h[0][0],s], dim=-1)
-            emb = self.project(x)
-            embs.append(emb)
-        return states,embs
+            s = h[2]*torch.randn_like(h[2])+h[1]
+            hs.append(h[0])
+            mus[:,i] = h[1]
+            sigmas[:,i] = h[2]
 
-    def project(self,x):
-        """
-        Projects the h vector into embedding space.
-
-        x: torch FloatTensor (B,H)
-            most likely want to use h vector as input here
-        """
-        return self.projection(x)
+            if self.attention is not None:
+                x = torch.cat([h[0][0],s], dim=-1)
+                score = self.attention(x)
+                scores.append(score)
+                temp = torch.cat(scores, dim=-1)
+                alphas = F.softmax(temp, dim=-1)
+                ss = torch.cat([mus[:,:i+1],sigmas[:,:i+1]], dim=-1)
+                state = torch.einsum("bsh,bs->bh", ss,alphas)
+            else:
+                state = torch.cat([h[1],h[2]], dim=-1)
+            states.append(state)
+        return hs,mus,sigmas,states
 
 class Decoder(nn.Module):
-    def __init__(self, emb_size, rssm_kwargs, stop_idx,
-                            proj_size=500, proj_layers=2,
-                            **kwargs):
+    def __init__(self, emb_size, rssm_kwargs, **kwargs):
         super().__init__()
         self.emb_size = emb_size
-        self.proj_size = proj_size
-        self.stop_idx = stop_idx
         self.rssm = RSSM(**rssm_kwargs)
         if try_kwarg(kwargs, 'wnorm', False):
             rnn = self.rssm.rnn
@@ -181,97 +190,133 @@ class Decoder(nn.Module):
             for name in names:
                 if 'bias' not in name:
                     rnn = nn.utils.weight_norm(rnn, name)
-        # Projection NN
-        modules = []
-        in_size = self.rssm.h_size+self.rssm.s_size
-        if proj_layers == 1:
-            modules.append(nn.Linear(in_size, emb_size))
-        else:
-            modules.append(nn.Linear(in_size, proj_size))
-        for i in range(proj_layers-1):
-            modules.append(nn.ReLU())
-            if i < proj_layers-2:
-                modules.append(nn.Linear(proj_size, proj_size))
-            else:
-                modules.append(nn.Linear(proj_size, emb_size))
-        self.projection = nn.Sequential(*modules)
 
     def init_h(self, batch_size):
         return self.rssm.init_h(batch_size)
 
-    def forward(self, h, seq_len, embs=None):
+    def forward(self, state, h, seq_len, embs=None, classifier=None,
+                                                   embeddings=None):
         """
         h: tuple of torch FloatTensors [(B,H), (B,S), (B,S)]
-            the final state of the encoding RSSM
+            the final state of the encoding RSSM. So it should
+            actually be (h, mu, sigma). Forgive the naming
+            abuse
         seq_len: int
             the number of decoding steps to perfor
-        embs: list of torch FloatTensors
+        embs: list of torch FloatTensors [S length (B,E)]
             the true sequence of embeddings. Must be of length
             seq_len. If none, rssm uses predicted embeddings.
+            Must argue classifier and embeddings if embs is None.
+        classifier: nn.Module
+            if embs is None, then there must be a classifier.
+            The classifier makes word predictions from the
+            h and s vectors.
+        embeddings: nn Parameter (N, E)
+            The real embeddings to be used as a representation
+            of strings. Must be included if embs is None.
         """
-        if embs is None:
-            emb = torch.zeros(len(enc), self.emb_size)
-            if next(self.parameters()).is_cuda:
-                emb = emb.to(DEVICE)
-        preds = [emb]
-        states = []
-        for i in range(seq_len+1):
-            x = preds[i] if embs is None else embs[i]
-            h = self.rssm(x,h)
-            states.append(h)
-            noise = torch.randn(h[1].shape)
-            if h[1].is_cuda:
-                noise = noise.to(DEVICE)
-            s = h[2]*noise + h[1]
-            x = torch.cat([h[0][0],s],dim=-1)
-            pred = self.project(x)
-            preds.append(embs)
-        return states,preds[1:]
+        x = torch.zeros(len(h[0][0]), self.emb_size)
+        if next(self.parameters()).is_cuda:
+            x = x.to(DEVICE)
 
-    def project(self,x):
-        """
-        Projects the h vector into embedding space.
+        hs = []
+        mus = []
+        sigmas = []
+        s_size = state.shape[1]//2
+        for i in range(seq_len):
+            s_mu, s_sig = torch.chunk(state,2,dim=-1)
+            s = s_sig*torch.randn_like(s_sig)+ s_mu
+            h,mu,sigma = self.rssm.state_fwd(x,h,s)
+            hs.append(h)
+            mus.append(mu)
+            sigmas.append(sigma)
+            h = (h,mu,sigma)
+            if embs is None:
+                pred = classifier(mu,sigma)
+                idxs = torch.argmax(pred, dim=-1).long()
+                x = embeddings[idxs]
+            else:
+                x = embs[i]
+        return hs,mus,sigmas
 
-        x: torch FloatTensor (B,H)
-            most likely want to use h vector as input here
+class WordEncoder(nn.Module):
+    def __init__(self, emb_size, s_size, min_sigma=0.0001,
+                                                **kwargs):
+        super().__init__()
+        self.emb_size = emb_size
+        self.s_size = s_size
+
+        self.encoder = nn.Linear(emb_size, s_size*2)
+
+    def forward(self, x):
         """
-        return self.projection(x)
+        x: torch FloatTensor (B,E)
+        """
+        musigma = self.encoder(x)
+        mu,sigma = torch.chunk(musigma,2,dim=-1)
+        sigma = F.softplus(sigma)
+        return mu, sigma
 
 class SeqAutoencoder(nn.Module):
-    def __init__(self, emb_size, n_words, stop_idx, **kwargs):
+    """
+    A sequence based autoencoder.
+    """
+    def __init__(self, emb_size, n_words, h_size=300, s_size=300,
+                                      attention=False, **kwargs):
         super().__init__()
         """
-        kwargs:
-            n_words
+        emb_size: int
+            size of the embedding dimension
+        n_words: int
+            number of unique embeddings to create
+        h_size: int
+            size of the deterministic hidden state in the recurrent
+            network
+        s_size: int
+            size of the stochastic hidden state in the recurrent
+            network
+        attention: bool
+            if true, uses an attention mechanism to create the final
+            encoding. If false, uses the final output of the encoder
+            as the encoding.
         """
         self.emb_size = emb_size
+        self.h_size = h_size
+        self.s_size = s_size
         self.n_words = n_words
+        self.attention = attention
 
         # Embeddings
         std = 2/float(np.sqrt(n_words+emb_size))
         self.embeddings = std*torch.randn(n_words,emb_size)
         self.embeddings = nn.Parameter(self.embeddings)
 
+        # Word Encoder
+        self.word_encoder = WordEncoder(emb_size, s_size)
+
         # Encoder
-        rssm_kwargs = {"h_size": kwargs['h_size'],
-                       "s_size": kwargs['s_size'],
+        rssm_kwargs = {"h_size": h_size,
+                       "s_size": s_size,
                        'emb_size': emb_size,
                        'rnn_type': kwargs['rnn_type']}
         self.encoder = Encoder(emb_size=emb_size,
-                             rssm_kwargs=rssm_kwargs, **kwargs)
+                                    attention=attention,
+                                    rssm_kwargs=rssm_kwargs,
+                                    **kwargs)
 
         # Decoder
-        rssm_kwargs = {"h_size": kwargs['h_size'],
-                       "s_size": kwargs['s_size'],
-                       'emb_size': emb_size,
+        rssm_kwargs = {"h_size": h_size,
+                       "s_size": s_size,
+                       'emb_size': emb_size+s_size,
                        'rnn_type': kwargs['rnn_type']}
-        self.decoder = Decoder(emb_size=emb_size,rssm_kwargs=rssm_kwargs,
-                                             stop_idx=stop_idx, **kwargs)
+        self.decoder = Decoder(emb_size=emb_size,
+                                    rssm_kwargs=rssm_kwargs,
+                                    **kwargs)
 
         # Classifier
         cl_type = kwargs['classifier_type']
         n_layers = kwargs['classifier_layers']
-        self.classifier = globals()[cl_type](emb_size=emb_size,
+        self.classifier = globals()[cl_type](s_size=s_size,
                                                n_words=n_words,
                                                n_layers=n_layers)
 
@@ -296,6 +341,9 @@ class SeqAutoencoder(nn.Module):
         embs = embs.reshape(*shape,embs.shape[-1])
         return embs
 
+    def encode_word(self, *args, **kwargs):
+        return self.word_encoder(*args, **kwargs)
+
     def encode(self, *args, **kwargs):
         return self.encoder(*args, **kwargs)
 
@@ -306,15 +354,16 @@ class SeqAutoencoder(nn.Module):
         return self.classifier(*args, **kwargs)
 
 class SimpleClassifier(nn.Module):
-    def __init__(self, emb_size, n_words, n_layers=2,**kwargs):
+    def __init__(self, s_size, n_words, n_layers=2,**kwargs):
         super().__init__()
-        self.emb_size = emb_size
+        self.s_size = s_size
         self.n_words = n_words
-        self.classifier = nn.Sequential(nn.Linear(emb_size, n_words//2),
+        self.classifier = nn.Sequential(nn.Linear(s_size, n_words//2),
                             nn.ReLU(),nn.Linear(n_words//2,n_words))
 
-    def forward(self, x):
-        return self.classifier(x)
+    def forward(self, mu, sigma):
+        s = sigma*torch.randn_like(sigma)+mu
+        return self.classifier(s)
 
 
 

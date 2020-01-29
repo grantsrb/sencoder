@@ -6,38 +6,32 @@ import os
 import copy
 
 class Nietzsche(Dataset):
-    def __init__(self, seq_len=10, stop_char="\0"):
+    def __init__(self, seq_len=10):
         file_name = "nietzsche.txt"
         url = "https://s3.amazonaws.com/text-datasets/nietzsche.txt"
-        self.stop_char = stop_char
         tup = self.get_data(file_name=file_name, url=url,
-                                         seq_len=seq_len,
-                                         stop_char=stop_char)
+                                         seq_len=seq_len)
         X,Y,word2idx,idx2word = tup
         self.X = X # (N, SeqLen)
         self.Y = Y # (N, SeqLen)
         self.word2idx = word2idx
         self.idx2word = idx2word
 
-    def get_data(self, file_name, url, seq_len, stop_char,
-                                                **kwargs):
+    def get_data(self, file_name, url, seq_len, **kwargs):
         # Get and prepare data
         data_path = get_file(file_name, origin=url)
         data = open(data_path, 'r')
     
         text = tokenize(data.read())
         words = set(text)
-        words.add(stop_char)
         print("Num unique words:", len(words))
     
         word2idx = {w:i for i,w in enumerate(words)}
         idx2word = {i:w for i,w in enumerate(words)}
     
-        stop_idx = word2idx[stop_char]
-        self.stop_idx = stop_idx
-        X = [[word2idx[text[i+j]] for j in range(seq_len)]+[stop_idx]\
+        X = [[word2idx[text[i+j]] for j in range(seq_len)]\
                             for i in range(len(text)-seq_len-1)]
-        Y = [[word2idx[text[i+j]] for j in range(seq_len)]+[stop_idx]\
+        Y = [[word2idx[text[i+j]] for j in range(seq_len)]\
                             for i in range(1,len(text)-seq_len)]
         X = torch.LongTensor(X)
         Y = torch.LongTensor(Y)
