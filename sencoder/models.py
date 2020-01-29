@@ -367,8 +367,14 @@ class StateClassifier(nn.Module):
         super().__init__()
         self.s_size = s_size
         self.n_words = n_words
-        self.classifier = nn.Sequential(nn.Linear(s_size, n_words//2),
-                            nn.ReLU(),nn.Linear(n_words//2,n_words))
+        modules = []
+        modules.append(nn.Linear(s_size, n_words//2))
+        modules.append(nn.ReLU())
+        for i in range(1,n_layers-1):
+            modules.append(nn.Linear(n_words//2, n_words//2))
+            modules.append(nn.ReLU())
+        modules.append(nn.Linear(n_words//2, n_words))
+        self.classifier = nn.Sequential(*modules)
 
     def forward(self, s):
         """
@@ -383,10 +389,23 @@ class MuSigClassifier(nn.Module):
         super().__init__()
         self.s_size = s_size
         self.n_words = n_words
-        self.classifier = nn.Sequential(nn.Linear(s_size, n_words//2),
-                            nn.ReLU(),nn.Linear(n_words//2,n_words))
+        modules.append(nn.Linear(s_size, n_words//2))
+        modules.append(nn.ReLU())
+        for i in range(1,n_layers-1):
+            modules.append(nn.Linear(n_words//2, n_words//2))
+            modules.append(nn.ReLU())
+        modules.append(nn.Linear(n_words//2, n_words))
+        self.classifier = nn.Sequential(*modules)
 
     def forward(self, mu, sigma):
+        """
+        mu: torch FloatTensor (B,N)
+            the mean of a gaussian as encoded by the encoder or
+            decoded by the decoder.
+        sigma: torch FloatTensor (B,N)
+            the std of a gaussian as encoded by the encoder or
+            decoded by the decoder.
+        """
         s = sigma*torch.randn_like(sigma)+mu
         return self.classifier(s)
 

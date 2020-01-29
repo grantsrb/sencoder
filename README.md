@@ -5,7 +5,7 @@ A sentence autoencoder using an RSSM and self attention.
 Currently can operate on the amazon nietzsche dataset to encode and
 decode strings of variable length.
 
-To train a model, you must first navigate to the `training_scripts` directory and add an entry in the `hyperranges.json` to search over. It comes preloaded with a learning rate search. You should additionally set the `hyperparameters.json` to your liking. See the `hyperparams_explained.txt` file for a description of each parameter.
+To train a model, you must first navigate to the `training_scripts` directory and add an entry in the `hyperranges.json` to search over. It comes preloaded with a learning rate search. You should additionally set the `hyperparameters.json` to your liking. See the `hyperparams_explained.md` file for a description of each parameter.
 
 Once the jsons are set appropriately, run the following:
 
