@@ -120,6 +120,11 @@ class RSSM(nn.Module, CustomModule):
 class Encoder(nn.Module):
     def __init__(self, emb_size, rssm_kwargs, attention=False,
                                                     **kwargs):
+        """
+        emb_size: int
+            the size of the embedding vectors
+        
+        """
         super().__init__()
         self.emb_size = emb_size
         self.attention = None
@@ -135,7 +140,7 @@ class Encoder(nn.Module):
         if attention:
             h_size = rssm_kwargs['h_size']
             s_size = rssm_kwargs['s_size']
-            self.attention = nn.Linear(h_size+s_size,1)
+            self.attention = nn.Linear(2*(h_size+s_size),1)
 
     def init_h(self, batch_size):
         return self.rssm.init_h(batch_size)
@@ -154,8 +159,7 @@ class Encoder(nn.Module):
         mus = torch.zeros(*X.shape[:2],self.rssm.s_size).to(DEVICE)
         sigmas = torch.zeros(*X.shape[:2],self.rssm.s_size).to(DEVICE)
         states = []
-        #scores = torch.zeros(*X.shape[:2]).to(DEVICE)
-        scores = []
+
         for i in range(X.shape[1]):
             x = X[:,i]
             h = self.rssm(x,h)
@@ -165,13 +169,18 @@ class Encoder(nn.Module):
             sigmas[:,i] = h[2]
 
             if self.attention is not None:
-                x = torch.cat([h[0][0],s], dim=-1)
-                score = self.attention(x)
-                scores.append(score)
+                scores = []
+                context = torch.cat([h[0][0],s], dim=-1)
+                for j in range(len(hs)):
+                    h, mu, sigma = hs[j][0][0], hs[j][1], hs[j][2]
+                    s = sigma*torch.randn_like(sigma)+mu
+                    x = torch.cat([context,h,s],dim=-1)
+                    score = self.attention(x)
+                    scores.append(score)
                 temp = torch.cat(scores, dim=-1)
                 alphas = F.softmax(temp, dim=-1)
                 ss = torch.cat([mus[:,:i+1],sigmas[:,:i+1]], dim=-1)
-                state = torch.einsum("bsh,bs->bh", ss,alphas)
+                state = torch.einsum("bsh,bs->bh", ss, alphas)
             else:
                 state = torch.cat([h[1],h[2]], dim=-1)
             states.append(state)
@@ -353,7 +362,23 @@ class SeqAutoencoder(nn.Module):
     def classify(self, *args, **kwargs):
         return self.classifier(*args, **kwargs)
 
-class SimpleClassifier(nn.Module):
+class StateClassifier(nn.Module):
+    def __init__(self, s_size, n_words, n_layers=2,**kwargs):
+        super().__init__()
+        self.s_size = s_size
+        self.n_words = n_words
+        self.classifier = nn.Sequential(nn.Linear(s_size, n_words//2),
+                            nn.ReLU(),nn.Linear(n_words//2,n_words))
+
+    def forward(self, s):
+        """
+        s: torch FloatTensor (B,N)
+            the state as encoded by the encoder (most likely using
+            self attention)
+        """
+        return self.classifier(s)
+
+class MuSigClassifier(nn.Module):
     def __init__(self, s_size, n_words, n_layers=2,**kwargs):
         super().__init__()
         self.s_size = s_size

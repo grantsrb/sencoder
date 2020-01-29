@@ -162,13 +162,18 @@ def train(hyps, verbose=False):
             enc_hs, enc_mus, enc_sigmas, enc_states = tup
             global_h = enc_hs[0]
             s_size = hyps['s_size']
-            mus = enc_mus.reshape(-1,s_size)
-            sigmas = enc_sigmas.reshape(-1,s_size)
-            enc_preds = model.classify(mus, sigmas)
+            states = torch.stack(enc_states,dim=1)
+            states = states.reshape(-1,states.shape[-1])
+            enc_preds = model.classify(states)
             enc_loss = enc_lossfxn(enc_preds, y) # scalar
 
+            # Decoder decodes for every dec_step_size steps. We make
+            # sure to include the maximum number of encoded steps.
+            # This is why the for loop looks complicated
             dec_loss = torch.zeros(1).to(DEVICE)
-            for j in range(0,len(enc_hs),5):
+            s = 'dec_step_size'
+            rng = list(range(0,len(enc_hs)-1,hyps[s]))+[len(enc_hs)-1]
+            for j in rng:
                 state = enc_states[j]
                 h = (enc_hs[j],enc_mus[:,j],enc_sigmas[:,j])
                 hs,mus,sigmas = model.decode(state, h, seq_len=j+1,
@@ -178,12 +183,16 @@ def train(hyps, verbose=False):
                 mus = mus.reshape(-1,s_size)
                 sigmas = torch.stack(sigmas, dim=1)
                 sigmas = sigmas.reshape(-1,s_size)
-                dec_preds = model.classify(mus, sigmas)
+                states = sigmas*torch.randn_like(sigmas)+mus
+                dec_preds = model.classify(states)
                 targs = torch.flip(X[:,:j+1],dims=(1,))
                 targs = targs.to(DEVICE).reshape(-1)
                 loss = dec_lossfxn(dec_preds, targs)/(j+1)
                 dec_losses[j] += loss.item()
                 dec_loss += loss
+                # TODO: include probability distance loss (probably
+                # KL Divergence) between decoder states and encoder
+                # states.
             loss = alpha*dec_loss + (1-alpha)*enc_loss
             #loss = enc_loss
             loss = loss/hyps['optim_batches']
