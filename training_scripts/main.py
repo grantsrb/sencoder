@@ -15,6 +15,8 @@ import select
 from sencoder.training import hyper_search
 from sencoder.utils import load_json
 
+torch.autograd.set_detect_anomaly(True)
+
 if __name__ == "__main__":
     hyperparams_file = "hyperparams.json"
     hyperranges_file = 'hyperranges.json'

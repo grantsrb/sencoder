@@ -9,7 +9,8 @@ setup(name='sencoder',
       url='',
       install_requires=[i.strip() for i in open("requirements.txt").readlines()],
       long_description='''
-          
+          Sequence to sequence autoencoder using an RSSM and self
+          attention.
           ''',
       classifiers=[
           'Intended Audience :: Science/Research',
