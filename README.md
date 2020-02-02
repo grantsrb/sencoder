@@ -16,18 +16,16 @@ $ python3 main.py <path_to_hyperparams_json> <path_to_hyperranges_json>
 Your model will be saved in a folder within a folder under the `exp_name` parameter set in the hyperparams.json. Note, setting the `exp_name` to "test" will override some of the parameters for testing.
 
 # Setup
-You will first need to install a lightweight tokenization package.
-Open a terminal session and type the following:
-```
-$ git clone https://github.com/grantsrb/tokenizer
-$ cd tokenizer
-$ pip3 install --user -e .
-```
-
-Then you will need to install the sencoder package:
+Open a bash session and type the following:
 
 ```
 $ git clone https://github.com/grantsrb/sencoder
 $ cd sencoder
 $ pip3 install --user -e .
+```
+
+If you are using Anaconda, change the last line to:
+
+```
+$ pip install -e .
 ```

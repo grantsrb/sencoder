@@ -141,7 +141,6 @@ def train(hyps, verbose=False):
         optimizer.zero_grad()
         seq_len = hyps['seq_len']
         dec_losses = [0 for i in range(seq_len)]
-        #global_h = model.encoder.init_h(batch_size)
         for i,(X,y) in enumerate(train_distr):
             """
             X: torch FloatTensor (B,S)
@@ -158,10 +157,7 @@ def train(hyps, verbose=False):
             embs = model.embed(X) # (B,S,E)
 
             # Make next word predictions with encoder
-            tup = model.encode(embs,h)
-            enc_hs, enc_mus, enc_sigmas, enc_states = tup
-            global_h = enc_hs[0]
-            s_size = hyps['s_size']
+            enc_hs,enc_states = model.encode(embs)
             states = torch.stack(enc_states,dim=1)
             states = states.reshape(-1,states.shape[-1])
             enc_preds = model.classify(states)
@@ -175,15 +171,12 @@ def train(hyps, verbose=False):
             rng = list(range(0,len(enc_hs)-1,hyps[s]))+[len(enc_hs)-1]
             for j in rng:
                 state = enc_states[j]
-                h = (enc_hs[j],enc_mus[:,j],enc_sigmas[:,j])
-                hs,mus,sigmas = model.decode(state, h, seq_len=j+1,
+                h = enc_hs[j]
+                states = model.decode(state, h, seq_len=j+1,
                                         classifier=model.classifier,
                                         embeddings=model.embeddings)
-                mus = torch.stack(mus, dim=1)
-                mus = mus.reshape(-1,s_size)
-                sigmas = torch.stack(sigmas, dim=1)
-                sigmas = sigmas.reshape(-1,s_size)
-                states = sigmas*torch.randn_like(sigmas)+mus
+                states = torch.stack(states,dim=1)
+                states = states.reshape(-1,states.shape[-1])
                 dec_preds = model.classify(states)
                 targs = torch.flip(X[:,:j+1],dims=(1,))
                 targs = targs.to(DEVICE).reshape(-1)
@@ -250,24 +243,20 @@ def train(hyps, verbose=False):
                 X = X.long()
                 embs = model.embed(X)
 
-                tup = model.encode(embs)
-                enc_hs, enc_mus, enc_sigmas, enc_states = tup
-                s_size = hyps['s_size']
-                mus = enc_mus.reshape(-1,s_size)
-                sigmas = enc_sigmas.reshape(-1,s_size)
-                enc_preds = model.classify(mus, sigmas)
+                enc_hs,enc_states = model.encode(embs)
+                states = torch.stack(enc_states,dim=1)
+                states = states.reshape(-1,states.shape[-1])
+                enc_preds = model.classify(states)
                 enc_loss = enc_lossfxn(enc_preds, y) # scalar
 
                 state = enc_states[-1]
-                h = (enc_hs[-1],enc_mus[:,-1],enc_sigmas[:,-1])
-                hs,mus,sigmas = model.decode(state,h,seq_len=seq_len,
+                h = enc_hs[-1]
+                states = model.decode(state, h, seq_len=seq_len,
                                         classifier=model.classifier,
                                         embeddings=model.embeddings)
-                mus = torch.stack(mus, dim=1)
-                mus = mus.reshape(-1,s_size)
-                sigmas = torch.stack(sigmas, dim=1)
-                sigmas = sigmas.reshape(-1,s_size)
-                dec_preds = model.classify(mus, sigmas)
+                states = torch.stack(states,dim=1)
+                states = states.reshape(-1,states.shape[-1])
+                dec_preds = model.classify(states)
                 targs = torch.flip(X[:,:],dims=(1,))
                 targs = targs.to(DEVICE).reshape(-1)
                 dec_loss = dec_lossfxn(dec_preds, targs)

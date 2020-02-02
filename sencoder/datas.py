@@ -1,6 +1,6 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
-from tokenizer import split_token, tokenize
+from sencoder.tokenizer import tokenize
 from keras.utils.data_utils import get_file
 import os
 import copy

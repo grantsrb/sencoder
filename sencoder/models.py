@@ -118,8 +118,7 @@ class RSSM(nn.Module, CustomModule):
                                     self.emb_size, self.min_sigma)
 
 class Encoder(nn.Module):
-    def __init__(self, emb_size, rssm_kwargs, attention=False,
-                                                    **kwargs):
+    def __init__(self, emb_size, rssm_kwargs, **kwargs):
         """
         emb_size: int
             the size of the embedding vectors
@@ -127,7 +126,6 @@ class Encoder(nn.Module):
         """
         super().__init__()
         self.emb_size = emb_size
-        self.attention = None
         self.rssm = RSSM(**rssm_kwargs)
         if try_kwarg(kwargs, 'wnorm', False):
             rnn = self.rssm.rnn
@@ -137,10 +135,9 @@ class Encoder(nn.Module):
             for name in names:
                 if 'bias' not in name:
                     rnn = nn.utils.weight_norm(rnn, name)
-        if attention:
-            h_size = rssm_kwargs['h_size']
-            s_size = rssm_kwargs['s_size']
-            self.attention = nn.Linear(2*(h_size+s_size),1)
+        h_size = rssm_kwargs['h_size']
+        s_size = rssm_kwargs['s_size']
+        self.attention = nn.Linear(2*(h_size+s_size),1)
 
     def init_h(self, batch_size):
         return self.rssm.init_h(batch_size)
@@ -159,32 +156,32 @@ class Encoder(nn.Module):
         mus = torch.zeros(*X.shape[:2],self.rssm.s_size).to(DEVICE)
         sigmas = torch.zeros(*X.shape[:2],self.rssm.s_size).to(DEVICE)
         states = []
+        attn_s = torch.zeros_like(h[1])
 
         for i in range(X.shape[1]):
             x = X[:,i]
-            h = self.rssm(x,h)
-            s = h[2]*torch.randn_like(h[2])+h[1]
+            h = self.rssm.state_fwd(x,h,attn_s)
             hs.append(h[0])
             mus[:,i] = h[1]
             sigmas[:,i] = h[2]
 
-            if self.attention is not None:
-                scores = []
-                context = torch.cat([h[0][0],s], dim=-1)
-                for j in range(len(hs)):
-                    h, mu, sigma = hs[j][0][0], hs[j][1], hs[j][2]
-                    s = sigma*torch.randn_like(sigma)+mu
-                    x = torch.cat([context,h,s],dim=-1)
-                    score = self.attention(x)
-                    scores.append(score)
-                temp = torch.cat(scores, dim=-1)
-                alphas = F.softmax(temp, dim=-1)
-                ss = torch.cat([mus[:,:i+1],sigmas[:,:i+1]], dim=-1)
-                state = torch.einsum("bsh,bs->bh", ss, alphas)
-            else:
-                state = torch.cat([h[1],h[2]], dim=-1)
-            states.append(state)
-        return hs,mus,sigmas,states
+            scores = []
+            s = h[2]*torch.randn_like(h[2])+h[1]
+            context = torch.cat([h[0][0],s], dim=-1)
+            for j in range(len(hs)):
+                hh, mu, sigma = hs[j][0], mus[:,j], sigmas[:,j]
+                s = sigma*torch.randn_like(sigma)+mu
+                x = torch.cat([context,hh,s],dim=-1)
+                score = self.attention(x)
+                scores.append(score)
+            temp = torch.cat(scores, dim=-1)
+            alphas = F.softmax(temp, dim=-1)
+            ss = torch.cat([mus[:,:i+1],sigmas[:,:i+1]], dim=-1)
+            ss = torch.einsum("bsh,bs->bh", ss, alphas)
+            s_mu,s_sig = torch.chunk(ss,2,dim=-1)
+            attn_s = s_sig*torch.randn_like(s_sig)+s_mu
+            states.append(torch.cat([h[1],s_mu,h[2],s_sig],dim=-1))
+        return hs, states
 
 class Decoder(nn.Module):
     def __init__(self, emb_size, rssm_kwargs, **kwargs):
@@ -199,6 +196,9 @@ class Decoder(nn.Module):
             for name in names:
                 if 'bias' not in name:
                     rnn = nn.utils.weight_norm(rnn, name)
+        h_size = rssm_kwargs['h_size']
+        s_size = rssm_kwargs['s_size']
+        self.attention = nn.Linear(2*(h_size+s_size),1)
 
     def init_h(self, batch_size):
         return self.rssm.init_h(batch_size)
@@ -206,10 +206,13 @@ class Decoder(nn.Module):
     def forward(self, state, h, seq_len, embs=None, classifier=None,
                                                    embeddings=None):
         """
-        h: tuple of torch FloatTensors [(B,H), (B,S), (B,S)]
-            the final state of the encoding RSSM. So it should
-            actually be (h, mu, sigma). Forgive the naming
-            abuse
+        state: torch FloatTensor (B,S)
+            the final state of the encoding RSSM. Consists of either
+            a mu and sigma or 2 mus and 2 sigmas depending on if you 
+            are using attention.
+        h: torch FloatTensor (B,H)
+            the deterministic state of the encoder at the point when
+            the state was made.
         seq_len: int
             the number of decoding steps to perfor
         embs: list of torch FloatTensors [S length (B,E)]
@@ -224,29 +227,50 @@ class Decoder(nn.Module):
             The real embeddings to be used as a representation
             of strings. Must be included if embs is None.
         """
-        x = torch.zeros(len(h[0][0]), self.emb_size)
+
+        s_mu,attn_mu,s_sig,attn_sig = torch.chunk(state,4,dim=-1)
+        h = (h,s_mu,s_sig)
+        x = torch.zeros(len(s_mu), self.emb_size)
         if next(self.parameters()).is_cuda:
             x = x.to(DEVICE)
 
         hs = []
-        mus = []
-        sigmas = []
+        shape = (len(s_mu), seq_len, s_sig.shape[-1])
+        mus = torch.zeros(shape).to(DEVICE)
+        sigmas = torch.zeros(shape).to(DEVICE)
+        states = []
         s_size = state.shape[1]//2
         for i in range(seq_len):
-            s_mu, s_sig = torch.chunk(state,2,dim=-1)
-            s = s_sig*torch.randn_like(s_sig)+ s_mu
-            h,mu,sigma = self.rssm.state_fwd(x,h,s)
+            attn_s = attn_sig*torch.randn_like(attn_sig)+attn_mu
+            h,mu,sigma = self.rssm.state_fwd(x,h,attn_s)
             hs.append(h)
-            mus.append(mu)
-            sigmas.append(sigma)
+            mus[:,i] = mu
+            sigmas[:,i] = sigma
+            s = sigma*torch.randn_like(sigma)+mu
+            context = torch.cat([h[0],s],dim=-1)
+            scores = []
             h = (h,mu,sigma)
+            for j in range(len(hs)):
+                hh,mu,sig = hs[j][0],mus[:,j],sigmas[:,j]
+                s = sig*torch.randn_like(sig)+mu
+                x = torch.cat([context,hh,s],dim=-1)
+                score = self.attention(x)
+                scores.append(score)
+            temp = torch.cat(scores, dim=-1)
+            alphas = F.softmax(temp, dim=-1)
+            musigs = torch.cat([mus[:,:i+1],sigmas[:,:i+1]], dim=-1)
+            musigs = torch.einsum("bsh,bs->bh", musigs, alphas)
+            attn_mu,attn_sig = torch.chunk(musigs,2,dim=-1)
+            attn_s = attn_sig*torch.randn_like(attn_sig)+attn_mu
+            state = torch.cat([h[1],attn_mu,h[2],attn_sig],dim=-1)
+            states.append(state)
             if embs is None:
-                pred = classifier(mu,sigma)
+                pred = classifier(state)
                 idxs = torch.argmax(pred, dim=-1).long()
                 x = embeddings[idxs]
             else:
                 x = embs[i]
-        return hs,mus,sigmas
+        return states
 
 class WordEncoder(nn.Module):
     def __init__(self, emb_size, s_size, min_sigma=0.0001,
@@ -271,7 +295,7 @@ class SeqAutoencoder(nn.Module):
     A sequence based autoencoder.
     """
     def __init__(self, emb_size, n_words, h_size=300, s_size=300,
-                                      attention=False, **kwargs):
+                                                       **kwargs):
         super().__init__()
         """
         emb_size: int
@@ -284,16 +308,11 @@ class SeqAutoencoder(nn.Module):
         s_size: int
             size of the stochastic hidden state in the recurrent
             network
-        attention: bool
-            if true, uses an attention mechanism to create the final
-            encoding. If false, uses the final output of the encoder
-            as the encoding.
         """
         self.emb_size = emb_size
         self.h_size = h_size
         self.s_size = s_size
         self.n_words = n_words
-        self.attention = attention
 
         # Embeddings
         std = 2/float(np.sqrt(n_words+emb_size))
@@ -306,10 +325,9 @@ class SeqAutoencoder(nn.Module):
         # Encoder
         rssm_kwargs = {"h_size": h_size,
                        "s_size": s_size,
-                       'emb_size': emb_size,
+                       'emb_size': emb_size+s_size,
                        'rnn_type': kwargs['rnn_type']}
         self.encoder = Encoder(emb_size=emb_size,
-                                    attention=attention,
                                     rssm_kwargs=rssm_kwargs,
                                     **kwargs)
 
@@ -326,8 +344,8 @@ class SeqAutoencoder(nn.Module):
         cl_type = kwargs['classifier_type']
         n_layers = kwargs['classifier_layers']
         self.classifier = globals()[cl_type](s_size=s_size,
-                                               n_words=n_words,
-                                               n_layers=n_layers)
+                                             n_words=n_words,
+                                             n_layers=n_layers)
 
     def enc_requires_grad(self, state):
         for p in self.encoder.parameters():
@@ -363,8 +381,9 @@ class SeqAutoencoder(nn.Module):
         return self.classifier(*args, **kwargs)
 
 class StateClassifier(nn.Module):
-    def __init__(self, s_size, n_words, n_layers=2,**kwargs):
+    def __init__(self, s_size, n_words, n_layers=2, **kwargs):
         super().__init__()
+        s_size = 2*s_size
         self.s_size = s_size
         self.n_words = n_words
         modules = []
@@ -382,11 +401,14 @@ class StateClassifier(nn.Module):
             the state as encoded by the encoder (most likely using
             self attention)
         """
+        mu,sig = torch.chunk(s,2,dim=-1)
+        s = sig*torch.randn_like(sig)+mu
         return self.classifier(s)
 
 class MuSigClassifier(nn.Module):
-    def __init__(self, s_size, n_words, n_layers=2,**kwargs):
+    def __init__(self, s_size, n_words, n_layers=2, **kwargs):
         super().__init__()
+        s_size = 2*s_size
         self.s_size = s_size
         self.n_words = n_words
         modules.append(nn.Linear(s_size, n_words//2))
