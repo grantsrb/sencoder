@@ -107,6 +107,8 @@ def train(hyps, verbose=False):
     # Initialize miscellaneous parameters 
     torch.cuda.empty_cache()
     batch_size = hyps['batch_size']
+    hyps['exp_num'] = get_exp_num(hyps['exp_name'])
+    hyps['save_folder'] = get_save_folder(hyps)
 
     # Get Data Distributers
     train_distr, val_distr = get_data_distrs(hyps)
@@ -157,8 +159,10 @@ def train(hyps, verbose=False):
             embs = model.embed(X) # (B,S,E)
 
             # Make next word predictions with encoder
-            enc_hs,enc_states = model.encode(embs)
-            states = torch.stack(enc_states,dim=1)
+            enc_hs,enc_mus,enc_sigs  = model.encode(embs)
+            mus = torch.stack(enc_mus,dim=1)
+            sigs = torch.stack(enc_sigs,dim=1)
+            states = sigs*torch.randn_like(sigs)+mus
             states = states.reshape(-1,states.shape[-1])
             enc_preds = model.classify(states)
             enc_loss = enc_lossfxn(enc_preds, y) # scalar
@@ -170,12 +174,13 @@ def train(hyps, verbose=False):
             s = 'dec_step_size'
             rng = list(range(0,len(enc_hs)-1,hyps[s]))+[len(enc_hs)-1]
             for j in rng:
-                state = enc_states[j]
-                h = enc_hs[j]
-                states = model.decode(state, h, seq_len=j+1,
+                h = (enc_hs[j],enc_mus[j],enc_sigs[j])
+                dec_mus, dec_sigs = model.decode(h, seq_len=j+1,
                                         classifier=model.classifier,
                                         embeddings=model.embeddings)
-                states = torch.stack(states,dim=1)
+                mus = torch.stack(dec_mus,dim=1)
+                sigs = torch.stack(dec_sigs,dim=1)
+                states = sigs*torch.randn_like(sigs)+mus
                 states = states.reshape(-1,states.shape[-1])
                 dec_preds = model.classify(states)
                 targs = torch.flip(X[:,:j+1],dims=(1,))
@@ -187,7 +192,6 @@ def train(hyps, verbose=False):
                 # KL Divergence) between decoder states and encoder
                 # states.
             loss = alpha*dec_loss + (1-alpha)*enc_loss
-            #loss = enc_loss
             loss = loss/hyps['optim_batches']
             loss.backward()
             if hyps['optim_batches'] == 1 or\
@@ -243,18 +247,21 @@ def train(hyps, verbose=False):
                 X = X.long()
                 embs = model.embed(X)
 
-                enc_hs,enc_states = model.encode(embs)
-                states = torch.stack(enc_states,dim=1)
+                enc_hs,enc_mus,enc_sigs  = model.encode(embs)
+                mus = torch.stack(enc_mus,dim=1)
+                sigs = torch.stack(enc_sigs,dim=1)
+                states = sigs*torch.randn_like(sigs)+mus
                 states = states.reshape(-1,states.shape[-1])
                 enc_preds = model.classify(states)
                 enc_loss = enc_lossfxn(enc_preds, y) # scalar
 
-                state = enc_states[-1]
-                h = enc_hs[-1]
-                states = model.decode(state, h, seq_len=seq_len,
+                h = (enc_hs[j],enc_mus[j],enc_sigs[j])
+                dec_mus, dec_sigs = model.decode(h, seq_len=seq_len,
                                         classifier=model.classifier,
                                         embeddings=model.embeddings)
-                states = torch.stack(states,dim=1)
+                mus = torch.stack(dec_mus,dim=1)
+                sigs = torch.stack(dec_sigs,dim=1)
+                states = sigs*torch.randn_like(sigs)+mus
                 states = states.reshape(-1,states.shape[-1])
                 dec_preds = model.classify(states)
                 targs = torch.flip(X[:,:],dims=(1,))
@@ -362,42 +369,48 @@ def train(hyps, verbose=False):
 
 def fill_hyper_q(hyps, hyp_ranges, keys, hyper_q, idx=0):
     """
-    Recursive function to load each of the hyperparameter combinations 
+    Recursive function to load each of the hyperparameter combinations
     onto a queue.
 
     hyps - dict of hyperparameters created by a HyperParameters object
         type: dict
         keys: name of hyperparameter
         values: value of hyperparameter
-    hyp_ranges - dict of ranges for hyperparameters to take over the search
+    hyp_ranges - dict of lists
+        these are the ranges that will change the hyperparameters for
+        each search
         type: dict
         keys: name of hyperparameters to be searched over
         values: list of values to search over for that hyperparameter
     keys - keys of the hyperparameters to be searched over. Used to
             specify order of keys to search
-    train - method that handles training of model. Should return a dict of results.
+    train - method that handles training of model. Should return a
+        dict of results.
     hyper_q - Queue to hold all parameter sets
     idx - the index of the current key to be searched over
+
+    Returns:
+        hyper_q: Queue of dicts `hyps`
     """
     # Base call, runs the training and saves the result
     if idx >= len(keys):
-        if 'exp_num' not in hyps:
-            if 'starting_exp_num' not in hyps: hyps['starting_exp_num'] = 0
-            hyps['exp_num'] = hyps['starting_exp_num']
-        hyps['save_folder'] = hyps['exp_name'] + "/" + hyps['exp_name'] +"_"+ str(hyps['exp_num']) 
-        for k in keys:
-            hyps['save_folder'] += "_" + str(k)+str(hyps[k])
+        if 'n_repeats' not in hyps: hyps['n_repeats'] = 1
+        # Pruning parameters
+        for i in range(hyps['n_repeats']):
+            # Load q
+            hyps['search_keys'] = ""
+            for k in keys:
+                hyps['search_keys'] += "_" + str(k)+str(hyps[k])
+            hyper_q.put({k:v for k,v in hyps.items()})
 
-        # Load q
-        hyper_q.put({k:v for k,v in hyps.items()})
-        hyps['exp_num'] += 1
-
-    # Non-base call. Sets a hyperparameter to a new search value and passes down the dict.
+    # Non-base call. Sets a hyperparameter to a new search value and
+    # passes down the dict.
     else:
         key = keys[idx]
         for param in hyp_ranges[key]:
             hyps[key] = param
-            hyper_q = fill_hyper_q(hyps, hyp_ranges, keys, hyper_q, idx+1)
+            hyper_q = fill_hyper_q(hyps, hyp_ranges, keys, hyper_q,
+                                                             idx+1)
     return hyper_q
 
 def hyper_search(hyps, hyp_ranges, keys, device, early_stopping=10,
@@ -433,4 +446,43 @@ def hyper_search(hyps, hyp_ranges, keys, device, early_stopping=10,
         with open(results_file,'a') as f:
             results = " -- ".join([str(k)+":"+str(results[k]) for k in sorted(results.keys())])
             f.write("\n"+results+"\n")
+
+def get_exp_num(exp_name):
+    """
+    Finds the next open experiment id number.
+
+    exp_name: str
+        path to the main experiment folder that contains the model
+        folders
+    """
+    exp_folder = os.path.expanduser(exp_name)
+    _, dirs, _ = next(os.walk(exp_folder))
+    exp_nums = set()
+    for d in dirs:
+        splt = d.split("_")
+        if len(splt) >= 2 and splt[0] == exp_name:
+            try:
+                exp_nums.add(int(splt[1]))
+            except:
+                pass
+    for i in range(len(exp_nums)):
+        if i not in exp_nums:
+            return i
+    return len(exp_nums)
+
+def get_save_folder(hyps):
+    """
+    Creates the save name for the model.
+
+    hyps: dict
+        keys:
+            exp_name: str
+            exp_num: int
+            search_keys: str
+    """
+    save_folder = "{}/{}_{}".format(hyps['exp_name'],
+                                    hyps['exp_name'],
+                                    hyps['exp_num'])
+    save_folder += hyps['search_keys']
+    return save_folder
 

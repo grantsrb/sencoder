@@ -8,6 +8,7 @@ Defaults to hyperparams.json and hyperranges.json if no arguments are provided
 """
 import sys
 import os
+import shutil
 import time
 import numpy as np
 import torch
@@ -63,50 +64,27 @@ if __name__ == "__main__":
     sleep_time = 8
     if os.path.exists(hyps['exp_name']):
         _, subds, _ = next(os.walk(hyps['exp_name']))
-        nums = []
+        dirs = []
         for d in subds:
-            try:
-                nums.append(int(d.split("_")[1]))
-            except:
-                pass
-        nums = sorted(nums)
-        if len(nums) == 0 and hyps['starting_exp_num'] is None:
-            hyps['starting_exp_num'] = 0
-        elif hyps['starting_exp_num'] is None:
-            hyps['starting_exp_num'] = nums[-1] + 1
-        if int(hyps['starting_exp_num']) in nums:
-            print("{0} WARNING: YOU ARE CURRENTLY DUPLICATING EXP NUMS {0}".format("!"*5))
-            print("Would you like to use", nums[-1]+1, "instead? (Y/n)")
+            splt = d.split("_")
+            if len(splt) >= 2 and splt[0] == hyps['exp_name']:
+                dirs.append(d)
+        dirs = sorted(dirs, key=lambda x: int(x.split("_")[1]))
+        if len(dirs) > 0:
+            s = "Overwrite last folder {}? (No/yes)".format(dirs[-1])
+            print(s)
             i,_,_ = select.select([sys.stdin], [],[],sleep_time)
-            if not i or (i and sys.stdin.readline().strip().lower() == "y"):
-                hyps['starting_exp_num'] = nums[-1]+1
-            elif i and sys.stdin.readline().strip().lower() != "n" and sys.stdin.readline().strip().lower() != "":
-                try:
-                    hyps['starting_exp_num'] = int(sys.stdin.readline().strip().lower())
-                except:
-                    print("Error parsing input")
-                    pass
+            if i and "y" in sys.stdin.readline().strip().lower():
+                path = os.path.join(hyps['exp_name'], dirs[-1])
+                shutil.rmtree(path, ignore_errors=True)
         else:
-            print("You have "+str(sleep_time)+" seconds to cancel experiment name "+
-                        hyps['exp_name']+" (num "+ str(hyps['starting_exp_num'])+"): ")
+            s = "You have {} seconds to cancel experiment name {}:"
+            print(s.format(sleep_time, hyps['exp_name']))
             i,_,_ = select.select([sys.stdin], [],[],sleep_time)
-            if i:
-                try:
-                    hyps['starting_exp_num'] = int(sys.stdin.readline().strip().lower())
-                except:
-                    pass
     else:
-        if hyps['starting_exp_num'] is None:
-            hyps['starting_exp_num'] = 0
-        print("You have "+str(sleep_time)+" seconds to cancel experiment name "+
-                    hyps['exp_name']+" (num "+ str(hyps['starting_exp_num'])+"): ")
+        s = "You have {} seconds to cancel experiment name {}:"
+        print(s.format(sleep_time, hyps['exp_name']))
         i,_,_ = select.select([sys.stdin], [],[],sleep_time)
-        if i:
-            try:
-                hyps['starting_exp_num'] = int(sys.stdin.readline().strip().lower())
-            except:
-                pass
-    print("Using start num:", hyps['starting_exp_num'])
     print()
 
     keys = list(hyp_ranges.keys())

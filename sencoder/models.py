@@ -56,7 +56,7 @@ class RSSM(nn.Module, CustomModule):
         self.rnn_type = rnn_type
         self.min_sigma = min_sigma
 
-        in_size = (s_size+emb_size)
+        in_size = (2*s_size+emb_size)
         self.rnn = globals()[rnn_type](input_size=in_size,
                                         hidden_size=h_size)
         # Creates mu and sigma for state gaussian
@@ -144,44 +144,69 @@ class Encoder(nn.Module):
 
     def forward(self, X, h=None):
         """
-        X: torch FloatTensor (B,S,E)
+        X: torch FloatTensor (B,T,E)
             batch of sequences of embeddings
-        h: tuple of FloatTensors ((B,H), (B,C))
-            if using LSTM, must include c vector as well as h.
-            If None, the state is initialized to zeros
+        h: tuple of FloatTensors ( ((B,H),), (B,S), (B,S))
+            if using LSTM, must include c vector as well as h in first
+            tuple value. If None, the deterministic state is
+            initialized to zeros, the stochastic mean is init to
+            zeros, and the stdev is init to ones
+
+        Returns:
+            joined_mus: list of FloatTensors (T len (B,2*S))
+                the decoder state means
+            joined_sigs: list of FloatTensors (T len (B,2*S))
+                the decoder state stdevs
         """
         if h is None:
             h = self.init_h(len(X))
         hs = []
+        hvecs = torch.zeros(*X.shape[:2],self.rssm.h_size).to(DEVICE)
         mus = torch.zeros(*X.shape[:2],self.rssm.s_size).to(DEVICE)
         sigmas = torch.zeros(*X.shape[:2],self.rssm.s_size).to(DEVICE)
-        states = []
-        attn_s = torch.zeros_like(h[1])
+        joined_mus = []
+        joined_sigs = []
+        attn_mu = torch.zeros_like(h[1])
+        attn_sig = torch.ones_like(h[2])
+        mu = torch.cat([h[1],attn_mu],dim=-1)
+        sig = torch.cat([h[2],attn_sig],dim=-1)
+        h = (h[0],mu,sig)
 
         for i in range(X.shape[1]):
             x = X[:,i]
-            h = self.rssm.state_fwd(x,h,attn_s)
+            h = self.rssm(x,h)
             hs.append(h[0])
+            hvecs[:,i] = h[0][0]
             mus[:,i] = h[1]
             sigmas[:,i] = h[2]
 
-            scores = []
+            j = len(hs)
             s = h[2]*torch.randn_like(h[2])+h[1]
-            context = torch.cat([h[0][0],s], dim=-1)
-            for j in range(len(hs)):
-                hh, mu, sigma = hs[j][0], mus[:,j], sigmas[:,j]
-                s = sigma*torch.randn_like(sigma)+mu
-                x = torch.cat([context,hh,s],dim=-1)
-                score = self.attention(x)
-                scores.append(score)
-            temp = torch.cat(scores, dim=-1)
-            alphas = F.softmax(temp, dim=-1)
-            ss = torch.cat([mus[:,:i+1],sigmas[:,:i+1]], dim=-1)
-            ss = torch.einsum("bsh,bs->bh", ss, alphas)
-            s_mu,s_sig = torch.chunk(ss,2,dim=-1)
-            attn_s = s_sig*torch.randn_like(s_sig)+s_mu
-            states.append(torch.cat([h[1],s_mu,h[2],s_sig],dim=-1))
-        return hs, states
+            context = torch.cat([h[0][0],s],dim=-1)
+            shape = (j,*context.shape)
+            context = context.expand(shape).permute(1,0,2)
+            context = context.reshape(-1,context.shape[-1])
+            hh,mu,sig = hvecs[:,:j], mus[:,:j], sigmas[:,:j]
+            hh = hh.reshape(-1,hh.shape[-1])
+            mu = mu.reshape(-1,mu.shape[-1])
+            sig = sig.reshape(-1,sig.shape[-1])
+            s = sig*torch.randn_like(sig)+mu
+            x = torch.cat([context,hh,s],dim=-1)
+            scores = self.attention(x)
+            scores = scores.reshape(len(h[1]),j)
+
+            alphas = F.softmax(scores, dim=-1)
+            attn_mu = torch.einsum('bsh,bs->bh',mus[:,:i+1].clone(),
+                                                             alphas)
+            mu = torch.cat([mus[:,i],attn_mu],dim=-1)
+            joined_mus.append(mu)
+            sigs = sigmas[:,:i+1]
+            attn_sig = torch.einsum('bsh,bs->bh', sigs.clone(),
+                                                        alphas)
+            sigma = torch.cat([sigmas[:,i],attn_sig],dim=-1)
+            joined_sigs.append(sigma)
+            h = (h[0],mu,sigma)
+        return hs, joined_mus, joined_sigs
 
 class Decoder(nn.Module):
     def __init__(self, emb_size, rssm_kwargs, **kwargs):
@@ -203,19 +228,20 @@ class Decoder(nn.Module):
     def init_h(self, batch_size):
         return self.rssm.init_h(batch_size)
 
-    def forward(self, state, h, seq_len, embs=None, classifier=None,
+    def forward(self, h, seq_len, embs=None, classifier=None,
                                                    embeddings=None):
         """
-        state: torch FloatTensor (B,S)
-            the final state of the encoding RSSM. Consists of either
-            a mu and sigma or 2 mus and 2 sigmas depending on if you 
-            are using attention.
-        h: torch FloatTensor (B,H)
-            the deterministic state of the encoder at the point when
-            the state was made.
+        h: tuple of torch FloatTensors (h,mu,sigma)
+            h: FloatTensor (B,H)
+                the deterministic state of the encoder at the point
+                when the state was made.
+            mu: FloatTensor (B,2*S)
+                the means of the stochastic state vector
+            sigma: FloatTensor (B,2*S)
+                the stdevs of the stochastic state vector
         seq_len: int
-            the number of decoding steps to perfor
-        embs: list of torch FloatTensors [S length (B,E)]
+            the number of decoding steps to perform
+        embs: list of torch FloatTensors [T length (B,E)]
             the true sequence of embeddings. Must be of length
             seq_len. If none, rssm uses predicted embeddings.
             Must argue classifier and embeddings if embs is None.
@@ -226,51 +252,65 @@ class Decoder(nn.Module):
         embeddings: nn Parameter (N, E)
             The real embeddings to be used as a representation
             of strings. Must be included if embs is None.
+
+        Returns:
+            joined_mus: list of FloatTensors (T len (B,2*S))
+                the decoder state means
+            joined_sigs: list of FloatTensors (T len (B,2*S))
+                the decoder state stdevs
         """
 
-        s_mu,attn_mu,s_sig,attn_sig = torch.chunk(state,4,dim=-1)
-        h = (h,s_mu,s_sig)
-        x = torch.zeros(len(s_mu), self.emb_size)
+        x = torch.zeros(len(h[1]), self.emb_size)
         if next(self.parameters()).is_cuda:
             x = x.to(DEVICE)
 
         hs = []
-        shape = (len(s_mu), seq_len, s_sig.shape[-1])
+        shape = (len(h[0][0]), seq_len, h[0][0].shape[-1])
+        hvecs = torch.zeros(shape).to(DEVICE)
+        shape = (len(h[1]), seq_len, h[1].shape[-1]//2)
         mus = torch.zeros(shape).to(DEVICE)
         sigmas = torch.zeros(shape).to(DEVICE)
-        states = []
-        s_size = state.shape[1]//2
+        joined_mus = []
+        joined_sigs = []
         for i in range(seq_len):
-            attn_s = attn_sig*torch.randn_like(attn_sig)+attn_mu
-            h,mu,sigma = self.rssm.state_fwd(x,h,attn_s)
-            hs.append(h)
-            mus[:,i] = mu
-            sigmas[:,i] = sigma
-            s = sigma*torch.randn_like(sigma)+mu
-            context = torch.cat([h[0],s],dim=-1)
-            scores = []
-            h = (h,mu,sigma)
-            for j in range(len(hs)):
-                hh,mu,sig = hs[j][0],mus[:,j],sigmas[:,j]
-                s = sig*torch.randn_like(sig)+mu
-                x = torch.cat([context,hh,s],dim=-1)
-                score = self.attention(x)
-                scores.append(score)
-            temp = torch.cat(scores, dim=-1)
-            alphas = F.softmax(temp, dim=-1)
-            musigs = torch.cat([mus[:,:i+1],sigmas[:,:i+1]], dim=-1)
-            musigs = torch.einsum("bsh,bs->bh", musigs, alphas)
-            attn_mu,attn_sig = torch.chunk(musigs,2,dim=-1)
-            attn_s = attn_sig*torch.randn_like(attn_sig)+attn_mu
-            state = torch.cat([h[1],attn_mu,h[2],attn_sig],dim=-1)
-            states.append(state)
+            h = self.rssm(x,h)
+            hs.append(h[0])
+            hvecs[:,i] = h[0][0]
+            mus[:,i] = h[1]
+            sigmas[:,i] = h[2]
+
+            j = len(hs)
+            s = h[2]*torch.randn_like(h[2])+h[1]
+            context = torch.cat([h[0][0],s],dim=-1)
+            shape = (j,*context.shape)
+            context = context.expand(shape).permute(1,0,2)
+            context = context.reshape(-1,context.shape[-1])
+            hh,mu,sig = hvecs[:,:j], mus[:,:j], sigmas[:,:j]
+            hh = hh.reshape(-1,hh.shape[-1])
+            mu = mu.reshape(-1,mu.shape[-1])
+            sig = sig.reshape(-1,sig.shape[-1])
+            s = sig*torch.randn_like(sig)+mu
+            x = torch.cat([context,hh,s],dim=-1)
+            scores = self.attention(x)
+            scores = scores.reshape(len(h[1]),j)
+
+            alphas = F.softmax(scores, dim=-1)
+            musig = torch.cat([mus[:,:i+1],sigmas[:,:i+1]],dim=-1)
+            musig = torch.einsum("bsh,bs->bh", musig, alphas)
+            attn_mu, attn_sig = torch.chunk(musig,2,dim=-1)
+            mu = torch.cat([h[1],attn_mu],dim=-1)
+            joined_mus.append(mu)
+            sig = torch.cat([h[2],attn_sig], dim=-1)
+            joined_sigs.append(sig)
+            h = (h[0],mu,sig)
             if embs is None:
+                state = mu + sig*torch.randn_like(sig)
                 pred = classifier(state)
                 idxs = torch.argmax(pred, dim=-1).long()
                 x = embeddings[idxs]
             else:
                 x = embs[i]
-        return states
+        return joined_mus, joined_sigs
 
 class WordEncoder(nn.Module):
     def __init__(self, emb_size, s_size, min_sigma=0.0001,
@@ -325,7 +365,7 @@ class SeqAutoencoder(nn.Module):
         # Encoder
         rssm_kwargs = {"h_size": h_size,
                        "s_size": s_size,
-                       'emb_size': emb_size+s_size,
+                       'emb_size': emb_size,
                        'rnn_type': kwargs['rnn_type']}
         self.encoder = Encoder(emb_size=emb_size,
                                     rssm_kwargs=rssm_kwargs,
@@ -334,7 +374,7 @@ class SeqAutoencoder(nn.Module):
         # Decoder
         rssm_kwargs = {"h_size": h_size,
                        "s_size": s_size,
-                       'emb_size': emb_size+s_size,
+                       'emb_size': emb_size,
                        'rnn_type': kwargs['rnn_type']}
         self.decoder = Decoder(emb_size=emb_size,
                                     rssm_kwargs=rssm_kwargs,
@@ -343,7 +383,7 @@ class SeqAutoencoder(nn.Module):
         # Classifier
         cl_type = kwargs['classifier_type']
         n_layers = kwargs['classifier_layers']
-        self.classifier = globals()[cl_type](s_size=s_size,
+        self.classifier = globals()[cl_type](s_size=2*s_size,
                                              n_words=n_words,
                                              n_layers=n_layers)
 
@@ -383,7 +423,7 @@ class SeqAutoencoder(nn.Module):
 class StateClassifier(nn.Module):
     def __init__(self, s_size, n_words, n_layers=2, **kwargs):
         super().__init__()
-        s_size = 2*s_size
+        s_size = s_size
         self.s_size = s_size
         self.n_words = n_words
         modules = []
@@ -401,14 +441,12 @@ class StateClassifier(nn.Module):
             the state as encoded by the encoder (most likely using
             self attention)
         """
-        mu,sig = torch.chunk(s,2,dim=-1)
-        s = sig*torch.randn_like(sig)+mu
         return self.classifier(s)
 
 class MuSigClassifier(nn.Module):
     def __init__(self, s_size, n_words, n_layers=2, **kwargs):
         super().__init__()
-        s_size = 2*s_size
+        s_size = s_size
         self.s_size = s_size
         self.n_words = n_words
         modules.append(nn.Linear(s_size, n_words//2))
