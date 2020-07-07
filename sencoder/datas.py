@@ -5,6 +5,43 @@ from keras.utils.data_utils import get_file
 import os
 import copy
 
+class WikiText2(Dataset):
+    def __init__(self, seq_len=10):
+        tup = self.get_data(seq_len=seq_len)
+        X,Y,word2idx,idx2word = tup
+        self.X = X # (N, SeqLen)
+        self.Y = Y # (N, SeqLen)
+        self.word2idx = word2idx
+        self.idx2word = idx2word
+
+    def get_data(self, seq_len):
+        # Get and prepare data
+        field = torchtext.data.Field(lower=True)
+        data = torchtext.datasets.WikiText2.splits(field)
+        tain_data, val_data, text_data = data
+        text = train_data[0].text
+        words = set(text)
+        print("Num unique words:", len(words))
+    
+        word2idx = {w:i for i,w in enumerate(words)}
+        idx2word = {i:w for i,w in enumerate(words)}
+    
+        X = [[word2idx[text[i+j]] for j in range(seq_len)]\
+                            for i in range(len(text)-seq_len-1)]
+        Y = [[word2idx[text[i+j]] for j in range(seq_len)]\
+                            for i in range(1,len(text)-seq_len)]
+        X = torch.LongTensor(X)
+        Y = torch.LongTensor(Y)
+
+        assert len(X) == len(Y)
+        return X, Y, word2idx, idx2word
+    
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.Y[idx]
+
 class Nietzsche(Dataset):
     def __init__(self, seq_len=10):
         file_name = "nietzsche.txt"
